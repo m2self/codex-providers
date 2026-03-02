@@ -1,0 +1,199 @@
+use anyhow::{Context as _, Result};
+
+pub fn set_secret(env_key: &str, value: &str) -> Result<()> {
+    platform::set_secret(env_key, value)
+}
+
+pub fn delete_secret(env_key: &str) -> Result<()> {
+    platform::delete_secret(env_key)
+}
+
+pub fn read_secret(env_key: &str) -> Result<Option<String>> {
+    platform::read_secret(env_key)
+}
+
+#[cfg(windows)]
+mod platform {
+    use super::*;
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
+    use winreg::RegKey;
+
+    pub fn set_secret(env_key: &str, value: &str) -> Result<()> {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let env = hkcu
+            .open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)
+            .with_context(|| "failed to open HKCU\\Environment")?;
+        env.set_value(env_key, &value)
+            .with_context(|| format!("failed to set {env_key} in HKCU\\Environment"))?;
+        broadcast_env_change();
+        Ok(())
+    }
+
+    pub fn delete_secret(env_key: &str) -> Result<()> {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let env = hkcu
+            .open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)
+            .with_context(|| "failed to open HKCU\\Environment")?;
+        match env.delete_value(env_key) {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to delete {env_key} from HKCU\\Environment")
+                })
+            }
+        }
+        broadcast_env_change();
+        Ok(())
+    }
+
+    pub fn read_secret(env_key: &str) -> Result<Option<String>> {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let env = hkcu
+            .open_subkey_with_flags("Environment", KEY_READ)
+            .with_context(|| "failed to open HKCU\\Environment")?;
+        match env.get_value(env_key) {
+            Ok(v) => Ok(Some(v)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err)
+                .with_context(|| format!("failed to read {env_key} from HKCU\\Environment")),
+        }
+    }
+
+    fn broadcast_env_change() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE,
+        };
+
+        let wide: Vec<u16> = "Environment"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        unsafe {
+            let mut result: usize = 0;
+            let _ = SendMessageTimeoutW(
+                HWND_BROADCAST,
+                WM_SETTINGCHANGE,
+                0,
+                wide.as_ptr() as isize,
+                SMTO_ABORTIFHUNG,
+                2000,
+                &mut result,
+            );
+        }
+    }
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+mod platform {
+    use super::*;
+    use crate::util;
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    const STORE_DIR: &str = ".bashrc.d";
+    const STORE_FILE: &str = "36-codex-providers.sh";
+
+    pub fn set_secret(env_key: &str, value: &str) -> Result<()> {
+        let mut map = load_map()?;
+        map.insert(env_key.to_string(), value.to_string());
+        write_map(&map)?;
+        Ok(())
+    }
+
+    pub fn delete_secret(env_key: &str) -> Result<()> {
+        let mut map = load_map()?;
+        map.remove(env_key);
+        write_map(&map)?;
+        Ok(())
+    }
+
+    pub fn read_secret(env_key: &str) -> Result<Option<String>> {
+        let map = load_map()?;
+        Ok(map.get(env_key).cloned())
+    }
+
+    fn store_path() -> Result<PathBuf> {
+        let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("failed to find home directory"))?;
+        Ok(home.join(STORE_DIR).join(STORE_FILE))
+    }
+
+    fn load_map() -> Result<BTreeMap<String, String>> {
+        let path = store_path()?;
+        let mut out = BTreeMap::new();
+        let text = match fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
+        };
+
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some(rest) = line.strip_prefix("export ") else {
+                continue;
+            };
+            let Some((k, v)) = rest.split_once('=') else {
+                continue;
+            };
+            let key = k.trim();
+            let raw = v.trim();
+
+            if raw.starts_with('\'') {
+                if let Some(unquoted) = util::bash_unquote_single_quoted_concatenation(raw) {
+                    out.insert(key.to_string(), unquoted);
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    fn write_map(map: &BTreeMap<String, String>) -> Result<()> {
+        let path = store_path()?;
+        let dir = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("store path has no parent"))?;
+        fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+
+        let mut file = fs::File::create(&path)
+            .with_context(|| format!("failed to create {}", path.display()))?;
+
+        let header = "# Generated by codex-providers. DO NOT EDIT.\n\
+# This file contains API keys as plaintext.\n\
+\n";
+        file.write_all(header.as_bytes()).ok();
+
+        for (k, v) in map {
+            let quoted = util::bash_single_quote(v);
+            writeln!(file, "export {k}={quoted}").ok();
+        }
+
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        Ok(())
+    }
+}
+
+#[cfg(not(any(windows, all(unix, target_os = "linux"))))]
+mod platform {
+    use super::*;
+
+    pub fn set_secret(_env_key: &str, _value: &str) -> Result<()> {
+        anyhow::bail!("unsupported OS for env persistence")
+    }
+
+    pub fn delete_secret(_env_key: &str) -> Result<()> {
+        anyhow::bail!("unsupported OS for env persistence")
+    }
+
+    pub fn read_secret(_env_key: &str) -> Result<Option<String>> {
+        anyhow::bail!("unsupported OS for env persistence")
+    }
+}
