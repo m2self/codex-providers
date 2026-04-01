@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Prepare artifact
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target\release\codex-providers.exe dist\codex-providers-windows-x86_64-msvc.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-providers-windows-x86_64-msvc
+          path: dist/codex-providers-windows-x86_64-msvc.exe
+
+  linux-centos7:
+    name: Linux (CentOS 7)
+    runs-on: ubuntu-latest
+    container: centos:7
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Switch CentOS 7 repos to vault
+        run: |
+          sed -i 's/^mirrorlist=/#mirrorlist=/' /etc/yum.repos.d/CentOS-*.repo
+          sed -i 's|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|' /etc/yum.repos.d/CentOS-*.repo
+          yum clean all
+          yum makecache
+
+      - name: Install build dependencies
+        run: |
+          yum install -y git curl ca-certificates gcc gcc-c++ make perl tar gzip
+          update-ca-trust || true
+
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: |
+          curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Run tests
+        run: |
+          source "$HOME/.cargo/env"
+          cargo test
+
+      - name: Build release
+        run: |
+          source "$HOME/.cargo/env"
+          cargo build --release
+
+      - name: Prepare artifact
+        run: |
+          mkdir -p dist
+          cp target/release/codex-providers dist/codex-providers-linux-x86_64-gnu-centos7
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-providers-linux-x86_64-gnu-centos7
+          path: dist/codex-providers-linux-x86_64-gnu-centos7
+
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs:
+      - windows
+      - linux-centos7
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: codex-providers-windows-x86_64-msvc
+          path: dist/windows
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: codex-providers-linux-x86_64-gnu-centos7
+          path: dist/linux
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/windows/codex-providers-windows-x86_64-msvc.exe \
+            dist/linux/codex-providers-linux-x86_64-gnu-centos7 \
+            --verify-tag \
+            --generate-notes \
+            --title "${GITHUB_REF_NAME}"

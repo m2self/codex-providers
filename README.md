@@ -125,3 +125,9 @@ Run the test suite:
 ```powershell
 cargo test
 ```
+
+## CI And Releases
+
+- GitHub Actions builds Windows and Linux artifacts on normal CI runs.
+- Pushing a Git tag triggers the same builds and then creates a GitHub Release
+  for that tag with both binaries attached.
