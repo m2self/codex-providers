@@ -40,47 +40,33 @@ jobs:
   linux-centos7:
     name: Linux (CentOS 7)
     runs-on: ubuntu-latest
-    container: centos:7
-
-    defaults:
-      run:
-        shell: bash
 
     steps:
-      - name: Switch CentOS 7 repos to vault
-        run: |
-          sed -i 's/^mirrorlist=/#mirrorlist=/' /etc/yum.repos.d/CentOS-*.repo
-          sed -i 's|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|' /etc/yum.repos.d/CentOS-*.repo
-          yum clean all
-          yum makecache
-
-      - name: Install build dependencies
-        run: |
-          yum install -y git curl ca-certificates gcc gcc-c++ make perl tar gzip
-          update-ca-trust || true
-
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Install Rust
+      - name: Build and test in CentOS 7 container
         run: |
-          curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain stable
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Run tests
-        run: |
-          source "$HOME/.cargo/env"
-          cargo test
-
-      - name: Build release
-        run: |
-          source "$HOME/.cargo/env"
-          cargo build --release
-
-      - name: Prepare artifact
-        run: |
-          mkdir -p dist
-          cp target/release/codex-providers dist/codex-providers-linux-x86_64-gnu-centos7
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/work" \
+            -w /work \
+            centos:7 \
+            bash -lc '
+              set -euo pipefail
+              sed -i "s/^mirrorlist=/#mirrorlist=/" /etc/yum.repos.d/CentOS-*.repo
+              sed -i "s|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|" /etc/yum.repos.d/CentOS-*.repo
+              yum clean all
+              yum makecache
+              yum install -y git curl ca-certificates gcc gcc-c++ make perl tar gzip
+              update-ca-trust || true
+              curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain stable
+              source "$HOME/.cargo/env"
+              cargo test
+              cargo build --release
+              mkdir -p dist
+              cp target/release/codex-providers dist/codex-providers-linux-x86_64-gnu-centos7
+              chmod a+r dist/codex-providers-linux-x86_64-gnu-centos7
+            '
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
