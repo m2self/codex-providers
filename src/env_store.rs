@@ -1,9 +1,5 @@
 use anyhow::{Context as _, Result};
 
-pub fn set_secret(env_key: &str, value: &str) -> Result<()> {
-    platform::set_secret(env_key, value)
-}
-
 pub fn delete_secret(env_key: &str) -> Result<()> {
     platform::delete_secret(env_key)
 }
@@ -17,17 +13,6 @@ mod platform {
     use super::*;
     use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
     use winreg::RegKey;
-
-    pub fn set_secret(env_key: &str, value: &str) -> Result<()> {
-        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        let env = hkcu
-            .open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)
-            .with_context(|| "failed to open HKCU\\Environment")?;
-        env.set_value(env_key, &value)
-            .with_context(|| format!("failed to set {env_key} in HKCU\\Environment"))?;
-        broadcast_env_change();
-        Ok(())
-    }
 
     pub fn delete_secret(env_key: &str) -> Result<()> {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
@@ -97,13 +82,6 @@ mod platform {
 
     const STORE_DIR: &str = ".bashrc.d";
     const STORE_FILE: &str = "36-codex-providers.sh";
-
-    pub fn set_secret(env_key: &str, value: &str) -> Result<()> {
-        let mut map = load_map()?;
-        map.insert(env_key.to_string(), value.to_string());
-        write_map(&map)?;
-        Ok(())
-    }
 
     pub fn delete_secret(env_key: &str) -> Result<()> {
         let mut map = load_map()?;
@@ -184,10 +162,6 @@ mod platform {
 #[cfg(not(any(windows, all(unix, target_os = "linux"))))]
 mod platform {
     use super::*;
-
-    pub fn set_secret(_env_key: &str, _value: &str) -> Result<()> {
-        anyhow::bail!("unsupported OS for env persistence")
-    }
 
     pub fn delete_secret(_env_key: &str) -> Result<()> {
         anyhow::bail!("unsupported OS for env persistence")
