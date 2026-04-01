@@ -85,6 +85,11 @@ jobs:
       contents: write
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
       - name: Download Windows artifact
         uses: actions/download-artifact@v4
         with:
@@ -100,6 +105,7 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           gh release create "${GITHUB_REF_NAME}" \
             dist/windows/codex-providers-windows-x86_64-msvc.exe \
