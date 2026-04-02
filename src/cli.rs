@@ -13,7 +13,7 @@ pub struct Cli {
     #[arg(long = "no-env")]
     pub no_env: bool,
 
-    /// Print resulting config/bundle to stdout; do not write files or delete env vars
+    /// Preview changes without writing files or deleting env vars
     #[arg(long = "dry-run")]
     pub dry_run: bool,
 
@@ -27,6 +27,8 @@ pub enum Command {
     List,
     /// Probe providers, select the first available one, and reorder config for faster future probing
     ProbeSelect,
+    /// Sync model_providers across this machine and remote machines over SSH
+    SshSync(SshSyncArgs),
     /// Add a provider
     Add(AddArgs),
     /// Update a provider
@@ -134,4 +136,15 @@ pub struct MigrateInlineTokenArgs {
     /// Confirm deleting legacy env vars during migration
     #[arg(long = "yes")]
     pub yes: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct SshSyncArgs {
+    /// Machine names from sync.toml to sync. Defaults to all configured machines.
+    #[arg(value_name = "NAME")]
+    pub names: Vec<String>,
+
+    /// Path to ~/.codex-providers/sync.toml
+    #[arg(long = "sync-config", value_name = "PATH")]
+    pub sync_config: Option<PathBuf>,
 }

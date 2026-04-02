@@ -4,6 +4,7 @@ mod cli;
 mod codex_config;
 mod env_store;
 mod probe;
+mod ssh_sync;
 mod util;
 
 use anyhow::{Context as _, Result};
@@ -35,6 +36,7 @@ fn run() -> Result<()> {
     match cli.command {
         cli::Command::List => cmd_list(&config),
         cli::Command::ProbeSelect => cmd_probe_select(&mut config, &opts),
+        cli::Command::SshSync(args) => cmd_ssh_sync(&mut config, &opts, args),
         cli::Command::Add(args) => cmd_add(&mut config, &opts, args),
         cli::Command::Update(args) => cmd_update(&mut config, &opts, args),
         cli::Command::Delete(args) => cmd_delete(&mut config, &opts, args),
@@ -82,6 +84,52 @@ fn cmd_probe_select_with_runner(
     eprintln!("selected\t{winner_id}");
 
     finish_write_config(config, opts)
+}
+
+fn cmd_ssh_sync(
+    config: &mut codex_config::CodexConfig,
+    opts: &GlobalOpts,
+    args: cli::SshSyncArgs,
+) -> Result<()> {
+    let sync_config_path = args
+        .sync_config
+        .clone()
+        .unwrap_or_else(ssh_sync::default_sync_config_path);
+    let sync_config = ssh_sync::SyncConfig::load(&sync_config_path)
+        .with_context(|| format!("failed to load sync config at {}", sync_config_path.display()))?;
+    let transport = ssh_sync::OpenSshTransport::new()?;
+    let report = ssh_sync::sync_providers(
+        config,
+        &sync_config,
+        &args.names,
+        &transport,
+        opts.dry_run,
+    )?;
+
+    for result in &report.precheck_results {
+        eprintln!("precheck\t{}\t{}", result.name, result.status);
+    }
+    if !report.added_provider_ids.is_empty() {
+        eprintln!(
+            "merge\tadded {}",
+            report.added_provider_ids.join(", ")
+        );
+    }
+    if !report.conflict_ids.is_empty() {
+        eprintln!(
+            "merge\tlocal-wins {}",
+            report.conflict_ids.join(", ")
+        );
+    }
+    for result in &report.apply_results {
+        eprintln!("apply\t{}\t{}", result.name, result.status);
+    }
+
+    if report.has_failures() {
+        anyhow::bail!("ssh-sync completed with failures");
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]

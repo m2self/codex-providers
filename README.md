@@ -13,6 +13,7 @@ practical local workflows:
 - migrate legacy `env_key` providers to inline bearer tokens
 - export and import portable provider bundles
 - probe providers in order, select the first available one, and reorder config
+- sync `[model_providers]` across machines over OpenSSH `sftp`
 
 ## Requirements
 
@@ -48,6 +49,7 @@ Top-level commands:
 - `export`
 - `import`
 - `migrate-inline-token`
+- `ssh-sync`
 
 Global options:
 
@@ -109,12 +111,47 @@ Import providers:
 cargo run -- import --in .\providers.toml
 ```
 
+Sync providers across this machine and every machine in
+`~/.codex-providers/sync.toml`:
+
+```powershell
+cargo run -- ssh-sync
+```
+
+Sync only one configured machine:
+
+```powershell
+cargo run -- ssh-sync office-win
+```
+
+Example `~/.codex-providers/sync.toml`:
+
+```toml
+machines = ["work-linux", "office-win"]
+```
+
 ## Notes
 
 - New writes use `experimental_bearer_token` instead of `env_key`.
 - `export` writes plaintext secrets. Treat exported bundles as sensitive files.
 - `probe-select` considers a provider available only if
   `GET {base_url}/models` returns `2xx` with bearer auth.
+- `ssh-sync` only syncs `[model_providers]`. It does not change each machine's
+  `model_provider`.
+- `ssh-sync` only supports providers with inline bearer tokens. Migrate legacy
+  `env_key` providers before syncing.
+- `ssh-sync` depends on the local OpenSSH `sftp` client. Remote read/write
+  stays on SFTP rather than remote shell scripts.
+- `ssh-sync` resolves machine aliases from `~/.ssh/config`. In `sync.toml` you
+  only list machine names; connection details belong in SSH config.
+- `ssh-sync` follows your system OpenSSH defaults for `HostName`, `User`,
+  `Port`, `IdentityFile`, and `ProxyJump`, and it passes
+  `StrictHostKeyChecking=accept-new` by default.
+- Unknown hosts are accepted and written to your default `known_hosts`; host
+  key mismatches still fail and must be fixed manually.
+- Remote Codex config is always assumed to live under the remote login home at
+  `.codex/config.toml`.
+- Old `sync.conf` is not supported anymore. Migrate to `sync.toml`.
 - `Cargo.lock` is intentionally ignored in this repo and not meant to be
   tracked.
 

@@ -99,6 +99,25 @@ impl CodexConfig {
         })
     }
 
+    pub fn from_text(path: &Path, text: &str) -> Result<Self> {
+        let doc = text
+            .parse::<DocumentMut>()
+            .with_context(|| format!("invalid TOML in {}", path.display()))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            doc,
+            insert_schema_header_on_render: false,
+        })
+    }
+
+    pub fn empty_at(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            doc: "".parse::<DocumentMut>().expect("empty TOML is valid"),
+            insert_schema_header_on_render: true,
+        }
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -340,6 +359,23 @@ impl CodexConfig {
         table.set_implicit(true);
         for (id, item) in reordered_items {
             let _ = table.insert(&id, item);
+        }
+        self.doc["model_providers"] = Item::Table(table);
+        Ok(())
+    }
+
+    pub fn get_provider_item(&self, id: &str) -> Result<Item> {
+        self.model_providers_table()
+            .and_then(|table| table.get(id))
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("provider '{}' not found", id))
+    }
+
+    pub fn replace_provider_items(&mut self, ordered_items: &[(String, Item)]) -> Result<()> {
+        let mut table = Table::new();
+        table.set_implicit(true);
+        for (id, item) in ordered_items {
+            let _ = table.insert(id, item.clone());
         }
         self.doc["model_providers"] = Item::Table(table);
         Ok(())
