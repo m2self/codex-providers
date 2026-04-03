@@ -74,6 +74,12 @@ OPENAI_API_KEY=sk-example
 '@ | cargo run -- add zapi
 ```
 
+`add <id>` also accepts a Cherry Studio deep link and extracts `baseUrl` + `apiKey`:
+
+```powershell
+"cherrystudio://providers/api-keys?v=1&data=..." | cargo run -- add zapi
+```
+
 Update an existing provider:
 
 ```powershell
@@ -134,8 +140,9 @@ machines = ["work-linux", "office-win"]
 
 - New writes use `experimental_bearer_token` instead of `env_key`.
 - `export` writes plaintext secrets. Treat exported bundles as sensitive files.
-- `probe-select` considers a provider available only if
-  `GET {base_url}/models` returns `2xx` with bearer auth.
+- `probe-select` considers a provider available only if a real
+  `POST {base_url}/chat/completions` test succeeds with the top-level
+  `model` from your local `config.toml`.
 - `ssh-sync` only syncs `[model_providers]`. It does not change each machine's
   `model_provider`.
 - `ssh-sync` only supports providers with inline bearer tokens. Migrate legacy

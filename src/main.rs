@@ -56,6 +56,10 @@ fn cmd_probe_select_with_runner(
     opts: &GlobalOpts,
     runner: &dyn probe::ProbeRunner,
 ) -> Result<()> {
+    let model = config
+        .get_model()
+        .filter(|model| !model.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("missing model in config.toml"))?;
     let ordered_ids = config.provider_ids_in_order();
     if ordered_ids.is_empty() {
         anyhow::bail!("no providers found to probe");
@@ -65,7 +69,7 @@ fn cmd_probe_select_with_runner(
     let mut winner_id = None;
 
     for (index, id) in ordered_ids.iter().enumerate() {
-        let result = probe_single_provider(config, id, runner)?;
+        let result = probe_single_provider(config, id, &model, runner)?;
         eprintln!("{}\t{}", result.id, result.summary());
         if result.is_success() {
             winner_index = Some(index);
@@ -631,6 +635,7 @@ fn resolve_probe_token(auth: &codex_config::ProviderAuthInfo) -> Option<String> 
 fn probe_single_provider(
     config: &codex_config::CodexConfig,
     id: &str,
+    model: &str,
     runner: &dyn probe::ProbeRunner,
 ) -> Result<probe::ProbeResult> {
     let Some(base_url) = config
@@ -645,7 +650,11 @@ fn probe_single_provider(
         return Ok(probe::ProbeResult::new(id, probe::ProbeOutcome::MissingToken));
     };
 
-    Ok(runner.probe(id, &base_url, &token))
+    if model.trim().is_empty() {
+        return Ok(probe::ProbeResult::new(id, probe::ProbeOutcome::MissingModel));
+    }
+
+    Ok(runner.probe(id, &base_url, &token, model))
 }
 
 fn reordered_probe_ids(ordered_ids: &[String], winner_index: usize) -> Vec<String> {
@@ -708,7 +717,7 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct FakeProbeRunner {
-        calls: RefCell<Vec<String>>,
+        calls: RefCell<Vec<(String, String)>>,
         results: BTreeMap<String, ProbeOutcome>,
     }
 
@@ -725,8 +734,10 @@ mod tests {
     }
 
     impl ProbeRunner for FakeProbeRunner {
-        fn probe(&self, id: &str, _base_url: &str, _token: &str) -> ProbeResult {
-            self.calls.borrow_mut().push(id.to_string());
+        fn probe(&self, id: &str, _base_url: &str, _token: &str, model: &str) -> ProbeResult {
+            self.calls
+                .borrow_mut()
+                .push((id.to_string(), model.to_string()));
             let outcome = self
                 .results
                 .get(id)
@@ -846,6 +857,37 @@ mod tests {
         assert!(rendered.contains("base_url = \"https://curl.example.com/v1\""));
         assert!(rendered.contains("experimental_bearer_token = \"sk-curl\""));
         assert_eq!(prompt.edit_calls.len(), 0);
+    }
+
+    #[test]
+    fn add_reads_piped_cherry_studio_link() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let mut config = load_config(&config_path);
+
+        let mut prompt = add_assist::FakePrompter::default();
+        let stdin = "cherrystudio://providers/api-keys?v=1&data=eyJpZCI6Im5ldy1hcGkiLCJiYXNlVXJsIjoiaHR0cHM6Ly9vcGVuYWkuYXBpLXRlc3QudXMuY2kiLCJhcGlLZXkiOiJzay04OG9pSmZIb1FjWU5PczYzYnFYY2E3c01CR01wVk5IT28xeWtuQWpERDl1T0hFRnYifQ%3D%3D";
+
+        cmd_add_with_prompt(
+            &mut config,
+            &opts(true),
+            cli::AddArgs {
+                id: "cherry".to_string(),
+                base_url: None,
+                key: None,
+                no_select: false,
+            },
+            add_assist::AddCommandIO::piped(stdin),
+            &mut prompt,
+        )
+        .expect("add should succeed from piped Cherry Studio link");
+
+        let rendered = config.render();
+        assert!(rendered.contains("model_provider = \"cherry\""));
+        assert!(rendered.contains("base_url = \"https://openai.api-test.us.ci\""));
+        assert!(rendered.contains(
+            "experimental_bearer_token = \"sk-88oiJfHoQcYNOs63bqXca7sMBGMpVNHOo1yknAjDD9uOHEFv\""
+        ));
     }
 
     #[test]
@@ -1029,6 +1071,7 @@ CODEX_LEGACY_KEY = "sk-imported"
             &config_path,
             r#"
 model_provider = "failfirst"
+model = "gpt-5.4"
 
 [model_providers.failfirst]
 name = "OpenAI"
@@ -1064,7 +1107,10 @@ experimental_bearer_token = "sk-later"
 
         assert_eq!(
             runner.calls.borrow().as_slice(),
-            &["failfirst".to_string(), "winner".to_string()]
+            &[
+                ("failfirst".to_string(), "gpt-5.4".to_string()),
+                ("winner".to_string(), "gpt-5.4".to_string())
+            ]
         );
         assert_eq!(config.get_model_provider().as_deref(), Some("winner"));
         assert_eq!(
@@ -1085,6 +1131,7 @@ experimental_bearer_token = "sk-later"
             &config_path,
             r#"
 model_provider = "zeta"
+model = "gpt-5.4"
 
 [model_providers.zeta]
 name = "OpenAI"
@@ -1119,8 +1166,43 @@ experimental_bearer_token = "sk-alpha"
         assert!(err.to_string().contains("no available provider"));
         assert_eq!(
             runner.calls.borrow().as_slice(),
-            &["zeta".to_string(), "alpha".to_string()]
+            &[
+                ("zeta".to_string(), "gpt-5.4".to_string()),
+                ("alpha".to_string(), "gpt-5.4".to_string())
+            ]
         );
         assert_eq!(config.render(), before);
+    }
+
+    #[test]
+    fn probe_select_fails_when_top_level_model_is_missing() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        write_config(
+            &config_path,
+            r#"
+model_provider = "alpha"
+
+[model_providers.alpha]
+name = "OpenAI"
+base_url = "https://alpha.example/v1"
+wire_api = "responses"
+requires_openai_auth = false
+experimental_bearer_token = "sk-alpha"
+"#,
+        );
+        let mut config = load_config(&config_path);
+        let runner = FakeProbeRunner {
+            calls: RefCell::new(Vec::new()),
+            results: [("alpha".to_string(), ProbeOutcome::Success(200))]
+                .into_iter()
+                .collect(),
+        };
+
+        let err = cmd_probe_select_with_runner(&mut config, &opts(true), &runner)
+            .expect_err("missing model should fail");
+
+        assert!(err.to_string().contains("missing model"));
+        assert!(runner.calls.borrow().is_empty());
     }
 }

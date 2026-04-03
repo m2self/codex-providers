@@ -1,4 +1,5 @@
 use anyhow::{Context as _, Result};
+use base64::Engine as _;
 use std::io::{self, IsTerminal, Read, Write};
 #[cfg(test)]
 use std::collections::VecDeque;
@@ -221,6 +222,21 @@ pub fn resolve_add_inputs(
 
 pub fn extract_candidates(content: &str) -> ExtractionResult {
     let mut result = ExtractionResult::default();
+
+    for payload in extract_cherry_studio_links(content) {
+        push_candidate(
+            &mut result.base_url_candidates,
+            payload.base_url,
+            "cherry-studio",
+            Confidence::High,
+        );
+        push_candidate(
+            &mut result.key_candidates,
+            payload.api_key,
+            "cherry-studio",
+            Confidence::High,
+        );
+    }
 
     for line in content.lines() {
         if let Some((lhs, rhs)) = split_assignment(line) {
@@ -495,6 +511,97 @@ fn extract_url_literals(text: &str) -> Vec<String> {
         .collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CherryStudioApiKeysPayload {
+    base_url: String,
+    api_key: String,
+}
+
+fn extract_cherry_studio_links(text: &str) -> Vec<CherryStudioApiKeysPayload> {
+    text.split_whitespace()
+        .filter_map(parse_cherry_studio_link)
+        .collect()
+}
+
+fn parse_cherry_studio_link(raw: &str) -> Option<CherryStudioApiKeysPayload> {
+    let token = raw.trim().trim_matches(|ch| {
+        matches!(ch, '"' | '\'' | '`' | ',' | ';' | ')' | '(' | '[' | ']' | '{' | '}')
+    });
+    if !token.starts_with("cherrystudio://") {
+        return None;
+    }
+
+    let url = url::Url::parse(token).ok()?;
+    if url.scheme() != "cherrystudio"
+        || url.host_str() != Some("providers")
+        || url.path() != "/api-keys"
+    {
+        return None;
+    }
+
+    let raw_data = extract_raw_query_param(url.query()?, "data")?;
+    let decoded = percent_decode_query_value(raw_data)?;
+    let normalized = decoded.replace('_', "+").replace('-', "/").replace(' ', "+");
+    let payload = base64::engine::general_purpose::STANDARD
+        .decode(normalized)
+        .ok()?;
+    let payload = String::from_utf8(payload).ok()?;
+    let payload = payload
+        .replace('\'', "\"")
+        .replace(['(', ')'], "");
+    let parsed: serde_json::Value = serde_json::from_str(&payload).ok()?;
+
+    let base_url = parsed
+        .get("baseUrl")
+        .and_then(serde_json::Value::as_str)
+        .and_then(normalize_base_url_candidate)?;
+    let api_key = parsed
+        .get("apiKey")
+        .and_then(serde_json::Value::as_str)
+        .and_then(clean_secret_value)?;
+
+    Some(CherryStudioApiKeysPayload { base_url, api_key })
+}
+
+fn extract_raw_query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    query.split('&').find_map(|pair| {
+        let (candidate_key, candidate_value) = pair.split_once('=')?;
+        (candidate_key == key).then_some(candidate_value)
+    })
+}
+
+fn percent_decode_query_value(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' => {
+                let hi = *bytes.get(index + 1)?;
+                let lo = *bytes.get(index + 2)?;
+                decoded.push((decode_hex_digit(hi)? << 4) | decode_hex_digit(lo)?);
+                index += 3;
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+
+    String::from_utf8(decoded).ok()
+}
+
+fn decode_hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn extract_standalone_tokens(text: &str) -> Vec<String> {
     text.split_whitespace()
         .filter_map(clean_secret_value)
@@ -694,5 +801,83 @@ mod tests {
         assert_eq!(prompt.edit_calls[0].initial, "https://api.example.com/v1");
         assert_eq!(prompt.edit_calls[1].initial, "sk-curl");
         assert!(prompt.confirm_calls[0].masked_key.contains("sk-"));
+    }
+
+    #[test]
+    fn extracts_cherry_studio_api_keys_link() {
+        let extraction = extract_candidates(
+            "cherrystudio://providers/api-keys?v=1&data=eyJpZCI6Im5ldy1hcGkiLCJiYXNlVXJsIjoiaHR0cHM6Ly9vcGVuYWkuYXBpLXRlc3QudXMuY2kiLCJhcGlLZXkiOiJzay04OG9pSmZIb1FjWU5PczYzYnFYY2E3c01CR01wVk5IT28xeWtuQWpERDl1T0hFRnYifQ%3D%3D",
+        );
+
+        assert_eq!(
+            extraction.best_base_url().map(|candidate| candidate.value.as_str()),
+            Some("https://openai.api-test.us.ci")
+        );
+        assert_eq!(
+            extraction.best_key().map(|candidate| candidate.value.as_str()),
+            Some("sk-88oiJfHoQcYNOs63bqXca7sMBGMpVNHOo1yknAjDD9uOHEFv")
+        );
+    }
+
+    #[test]
+    fn ignores_invalid_cherry_studio_data() {
+        let extraction = extract_candidates(
+            "cherrystudio://providers/api-keys?v=1&data=not-valid-base64",
+        );
+
+        assert_eq!(extraction.best_base_url(), None);
+        assert_eq!(extraction.best_key(), None);
+    }
+
+    #[test]
+    fn ignores_non_api_keys_cherry_studio_link() {
+        let extraction = extract_candidates(
+            "cherrystudio://providers/models?v=1&data=eyJmb28iOiJiYXIifQ%3D%3D",
+        );
+
+        assert_eq!(extraction.best_base_url(), None);
+        assert_eq!(extraction.best_key(), None);
+    }
+
+    #[test]
+    fn extracts_url_safe_cherry_studio_api_keys_link() {
+        let payload = r#"{"id":"new-api","baseUrl":"https://openai.api-test.us.ci/v1/chat/completions","apiKey":"sk-url-safe"}"#;
+        let data = base64::engine::general_purpose::URL_SAFE.encode(payload);
+        let extraction = extract_candidates(&format!(
+            "cherrystudio://providers/api-keys?v=1&data={data}"
+        ));
+
+        assert_eq!(
+            extraction.best_base_url().map(|candidate| candidate.value.as_str()),
+            Some("https://openai.api-test.us.ci/v1")
+        );
+        assert_eq!(
+            extraction.best_key().map(|candidate| candidate.value.as_str()),
+            Some("sk-url-safe")
+        );
+    }
+
+    #[test]
+    fn ignores_cherry_studio_link_with_invalid_json_payload() {
+        let payload =
+            base64::engine::general_purpose::STANDARD.encode("not-json");
+        let extraction = extract_candidates(&format!(
+            "cherrystudio://providers/api-keys?v=1&data={payload}"
+        ));
+
+        assert_eq!(extraction.best_base_url(), None);
+        assert_eq!(extraction.best_key(), None);
+    }
+
+    #[test]
+    fn ignores_cherry_studio_link_without_required_fields() {
+        let payload = base64::engine::general_purpose::STANDARD
+            .encode(r#"{"id":"new-api","baseUrl":"https://openai.api-test.us.ci"}"#);
+        let extraction = extract_candidates(&format!(
+            "cherrystudio://providers/api-keys?v=1&data={payload}"
+        ));
+
+        assert_eq!(extraction.best_base_url(), None);
+        assert_eq!(extraction.best_key(), None);
     }
 }

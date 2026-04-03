@@ -256,6 +256,13 @@ impl CodexConfig {
             .map(|s| s.to_string())
     }
 
+    pub fn get_model(&self) -> Option<String> {
+        self.doc
+            .get("model")
+            .and_then(|i| i.as_str())
+            .map(|s| s.to_string())
+    }
+
     pub fn set_model_provider(&mut self, id: &str) -> Result<()> {
         self.doc["model_provider"] = value(id);
         Ok(())
@@ -577,6 +584,42 @@ env_key = "CODEX_B_KEY"
         cfg.delete_provider("b").unwrap();
         assert!(!cfg.provider_exists("b"));
         assert_eq!(cfg.get_model_provider().as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn get_model_reads_top_level_model() {
+        let cfg = CodexConfig {
+            path: PathBuf::from("config.toml"),
+            doc: doc_from(
+                r#"
+model = "gpt-5.4"
+"#,
+            ),
+            insert_schema_header_on_render: false,
+        };
+
+        assert_eq!(cfg.get_model().as_deref(), Some("gpt-5.4"));
+    }
+
+    #[test]
+    fn get_model_distinguishes_missing_and_empty() {
+        let missing = CodexConfig {
+            path: PathBuf::from("config.toml"),
+            doc: doc_from(""),
+            insert_schema_header_on_render: false,
+        };
+        assert_eq!(missing.get_model(), None);
+
+        let empty = CodexConfig {
+            path: PathBuf::from("config.toml"),
+            doc: doc_from(
+                r#"
+model = ""
+"#,
+            ),
+            insert_schema_header_on_render: false,
+        };
+        assert_eq!(empty.get_model().as_deref(), Some(""));
     }
 
     #[test]
