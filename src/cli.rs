@@ -25,8 +25,12 @@ pub struct Cli {
 pub enum Command {
     /// List providers in config.toml
     List,
+    /// Benchmark providers and print ranking without changing config
+    Benchmark(BenchmarkSelectArgs),
     /// Probe providers, select the first available one, and reorder config for faster future probing
     ProbeSelect,
+    /// Benchmark providers, sort them by performance, and select the recommended default
+    BenchmarkSelect(BenchmarkSelectArgs),
     /// Sync model_providers across this machine and remote machines over SSH
     SshSync(SshSyncArgs),
     /// Add a provider
@@ -147,4 +151,11 @@ pub struct SshSyncArgs {
     /// Path to ~/.codex-providers/sync.toml
     #[arg(long = "sync-config", value_name = "PATH")]
     pub sync_config: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct BenchmarkSelectArgs {
+    /// Benchmark rounds per provider
+    #[arg(long = "rounds", value_name = "N", default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..=3))]
+    pub rounds: u32,
 }

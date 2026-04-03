@@ -42,7 +42,9 @@ cargo build --release
 Top-level commands:
 
 - `list`
+- `benchmark`
 - `probe-select`
+- `benchmark-select`
 - `add`
 - `update`
 - `delete`
@@ -105,6 +107,26 @@ provider table for the next run:
 cargo run -- probe-select
 ```
 
+Benchmark every configured provider with the top-level `model` and print the
+performance ranking without changing config:
+
+```powershell
+cargo run -- benchmark
+```
+
+Benchmark every configured provider with the top-level `model`, reorder
+providers by performance, and select the recommended default provider:
+
+```powershell
+cargo run -- benchmark-select
+```
+
+Use three rounds instead of the default two:
+
+```powershell
+cargo run -- benchmark-select --rounds 3
+```
+
 Export providers:
 
 ```powershell
@@ -143,6 +165,13 @@ machines = ["work-linux", "office-win"]
 - `probe-select` considers a provider available only if a real
   `POST {base_url}/chat/completions` test succeeds with the top-level
   `model` from your local `config.toml`.
+- `benchmark` uses the same provider benchmark as `benchmark-select`, but it is
+  read-only: it prints sorted performance results and does not change
+  `config.toml`.
+- `benchmark-select` benchmarks providers with the same top-level `model`,
+  reorders `[model_providers]` by the benchmark result, and updates
+  `model_provider` to the recommended provider. It does not change the top-level
+  `model`.
 - `ssh-sync` only syncs `[model_providers]`. It does not change each machine's
   `model_provider`.
 - `ssh-sync` only supports providers with inline bearer tokens. Migrate legacy

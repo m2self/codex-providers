@@ -1,4 +1,5 @@
 mod add_assist;
+mod benchmark;
 mod bundle;
 mod cli;
 mod codex_config;
@@ -35,7 +36,9 @@ fn run() -> Result<()> {
 
     match cli.command {
         cli::Command::List => cmd_list(&config),
+        cli::Command::Benchmark(args) => cmd_benchmark(&config, args),
         cli::Command::ProbeSelect => cmd_probe_select(&mut config, &opts),
+        cli::Command::BenchmarkSelect(args) => cmd_benchmark_select(&mut config, &opts, args),
         cli::Command::SshSync(args) => cmd_ssh_sync(&mut config, &opts, args),
         cli::Command::Add(args) => cmd_add(&mut config, &opts, args),
         cli::Command::Update(args) => cmd_update(&mut config, &opts, args),
@@ -49,6 +52,31 @@ fn run() -> Result<()> {
 fn cmd_probe_select(config: &mut codex_config::CodexConfig, opts: &GlobalOpts) -> Result<()> {
     let runner = probe::HttpProbeRunner::new()?;
     cmd_probe_select_with_runner(config, opts, &runner)
+}
+
+fn cmd_benchmark(
+    config: &codex_config::CodexConfig,
+    args: cli::BenchmarkSelectArgs,
+) -> Result<()> {
+    let runner = benchmark::HttpBenchmarkRunner::new()?;
+    cmd_benchmark_with_runner(config, args, &runner)
+}
+
+fn cmd_benchmark_select(
+    config: &mut codex_config::CodexConfig,
+    opts: &GlobalOpts,
+    args: cli::BenchmarkSelectArgs,
+) -> Result<()> {
+    let runner = benchmark::HttpBenchmarkRunner::new()?;
+    cmd_benchmark_select_with_runner(config, opts, args, &runner)
+}
+
+#[derive(Debug, Clone)]
+struct BenchmarkRunReport {
+    model: String,
+    rounds: u32,
+    results: Vec<benchmark::ProviderBenchmarkResult>,
+    ranking: benchmark::BenchmarkRanking,
 }
 
 fn cmd_probe_select_with_runner(
@@ -88,6 +116,40 @@ fn cmd_probe_select_with_runner(
     eprintln!("selected\t{winner_id}");
 
     finish_write_config(config, opts)
+}
+
+fn cmd_benchmark_select_with_runner(
+    config: &mut codex_config::CodexConfig,
+    opts: &GlobalOpts,
+    args: cli::BenchmarkSelectArgs,
+    runner: &dyn benchmark::BenchmarkRunner,
+) -> Result<()> {
+    let report = build_benchmark_report(config, args, runner)?;
+    print_benchmark_report_in_config_order(&report);
+
+    let Some(recommended_id) = report.ranking.recommended_id.clone() else {
+        anyhow::bail!("no benchmarkable provider found");
+    };
+
+    config.set_model_provider(&recommended_id)?;
+    config.reorder_providers(&report.ranking.ordered_ids)?;
+
+    finish_write_config(config, opts)
+}
+
+fn cmd_benchmark_with_runner(
+    config: &codex_config::CodexConfig,
+    args: cli::BenchmarkSelectArgs,
+    runner: &dyn benchmark::BenchmarkRunner,
+) -> Result<()> {
+    let report = build_benchmark_report(config, args, runner)?;
+    print_benchmark_report_in_ranking_order(&report);
+
+    if report.ranking.recommended_id.is_none() {
+        anyhow::bail!("no benchmarkable provider found");
+    }
+
+    Ok(())
 }
 
 fn cmd_ssh_sync(
@@ -657,6 +719,69 @@ fn probe_single_provider(
     Ok(runner.probe(id, &base_url, &token, model))
 }
 
+fn benchmark_single_provider(
+    config: &codex_config::CodexConfig,
+    id: &str,
+    model: &str,
+    rounds: u32,
+    runner: &dyn benchmark::BenchmarkRunner,
+) -> Result<benchmark::ProviderBenchmarkResult> {
+    let Some(base_url) = config
+        .get_provider_base_url(id)?
+        .filter(|base_url| !base_url.trim().is_empty())
+    else {
+        return Ok(benchmark::ProviderBenchmarkResult::new(
+            id,
+            benchmark::ProviderBenchmarkOutcome::MissingBaseUrl,
+        ));
+    };
+
+    let auth = config.get_provider_auth_info(id)?;
+    let Some(token) = resolve_probe_token(&auth) else {
+        return Ok(benchmark::ProviderBenchmarkResult::new(
+            id,
+            benchmark::ProviderBenchmarkOutcome::MissingToken,
+        ));
+    };
+
+    if model.trim().is_empty() {
+        return Ok(benchmark::ProviderBenchmarkResult::new(
+            id,
+            benchmark::ProviderBenchmarkOutcome::MissingModel,
+        ));
+    }
+
+    Ok(runner.benchmark(id, &base_url, &token, model, rounds))
+}
+
+fn build_benchmark_report(
+    config: &codex_config::CodexConfig,
+    args: cli::BenchmarkSelectArgs,
+    runner: &dyn benchmark::BenchmarkRunner,
+) -> Result<BenchmarkRunReport> {
+    let model = config
+        .get_model()
+        .filter(|model| !model.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("missing model in config.toml"))?;
+    let ordered_ids = config.provider_ids_in_order();
+    if ordered_ids.is_empty() {
+        anyhow::bail!("no providers found to benchmark");
+    }
+
+    let mut results = Vec::with_capacity(ordered_ids.len());
+    for id in &ordered_ids {
+        results.push(benchmark_single_provider(config, id, &model, args.rounds, runner)?);
+    }
+
+    let ranking = benchmark::rank_benchmark_results(&results);
+    Ok(BenchmarkRunReport {
+        model,
+        rounds: args.rounds,
+        results,
+        ranking,
+    })
+}
+
 fn reordered_probe_ids(ordered_ids: &[String], winner_index: usize) -> Vec<String> {
     let mut reordered = Vec::with_capacity(ordered_ids.len());
     reordered.push(ordered_ids[winner_index].clone());
@@ -665,9 +790,100 @@ fn reordered_probe_ids(ordered_ids: &[String], winner_index: usize) -> Vec<Strin
     reordered
 }
 
+fn print_benchmark_report_in_config_order(report: &BenchmarkRunReport) {
+    let _ = (&report.model, report.rounds);
+    for result in &report.results {
+        eprintln!("{}\t{}", result.id, result.summary());
+    }
+    print_benchmark_summary(
+        "fastest",
+        &report.ranking.fastest_id,
+        &report.results,
+        |stats| format!("median={}ms", stats.median_ms),
+    );
+    print_benchmark_summary(
+        "quickest-first-token",
+        &report.ranking.quickest_first_token_id,
+        &report.results,
+        |stats| match stats.first_token_median_ms {
+            Some(ms) => format!("firstToken={}ms", ms),
+            None => "firstToken=-".to_string(),
+        },
+    );
+    print_benchmark_summary(
+        "most-stable",
+        &report.ranking.most_stable_id,
+        &report.results,
+        |stats| format!("stability={}ms", stats.stability_ms),
+    );
+    print_benchmark_summary(
+        "recommended",
+        &report.ranking.recommended_id,
+        &report.results,
+        |stats| format!("score={}", stats.score()),
+    );
+}
+
+fn print_benchmark_report_in_ranking_order(report: &BenchmarkRunReport) {
+    let _ = (&report.model, report.rounds);
+    for id in &report.ranking.ordered_ids {
+        if let Some(result) = report.results.iter().find(|result| result.id == *id) {
+            eprintln!("{}\t{}", result.id, result.summary());
+        }
+    }
+    print_benchmark_summary(
+        "fastest",
+        &report.ranking.fastest_id,
+        &report.results,
+        |stats| format!("median={}ms", stats.median_ms),
+    );
+    print_benchmark_summary(
+        "quickest-first-token",
+        &report.ranking.quickest_first_token_id,
+        &report.results,
+        |stats| match stats.first_token_median_ms {
+            Some(ms) => format!("firstToken={}ms", ms),
+            None => "firstToken=-".to_string(),
+        },
+    );
+    print_benchmark_summary(
+        "most-stable",
+        &report.ranking.most_stable_id,
+        &report.results,
+        |stats| format!("stability={}ms", stats.stability_ms),
+    );
+    print_benchmark_summary(
+        "recommended",
+        &report.ranking.recommended_id,
+        &report.results,
+        |stats| format!("score={}", stats.score()),
+    );
+}
+
+fn print_benchmark_summary(
+    label: &str,
+    id: &Option<String>,
+    results: &[benchmark::ProviderBenchmarkResult],
+    metric: impl Fn(&benchmark::ProviderBenchmarkStats) -> String,
+) {
+    if let Some(id) = id {
+        if let Some(stats) = results
+            .iter()
+            .find(|result| result.id == *id)
+            .and_then(benchmark::ProviderBenchmarkResult::stats)
+        {
+            eprintln!("{label}\t{id}\t{}", metric(stats));
+            return;
+        }
+    }
+
+    eprintln!("{label}\t-");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::benchmark::BenchmarkRunner;
     use crate::probe::{ProbeOutcome, ProbeResult, ProbeRunner};
     use std::cell::RefCell;
     use std::fs;
@@ -744,6 +960,47 @@ mod tests {
                 .cloned()
                 .unwrap_or(ProbeOutcome::TransportError("unexpected".to_string()));
             ProbeResult::new(id, outcome)
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeBenchmarkRunner {
+        calls: RefCell<Vec<(String, String, u32)>>,
+        results: BTreeMap<String, benchmark::ProviderBenchmarkOutcome>,
+    }
+
+    impl FakeBenchmarkRunner {
+        fn with_results<const N: usize>(
+            results: [(&str, benchmark::ProviderBenchmarkOutcome); N],
+        ) -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                results: results
+                    .into_iter()
+                    .map(|(id, outcome)| (id.to_string(), outcome))
+                    .collect(),
+            }
+        }
+    }
+
+    impl BenchmarkRunner for FakeBenchmarkRunner {
+        fn benchmark(
+            &self,
+            id: &str,
+            _base_url: &str,
+            _token: &str,
+            model: &str,
+            rounds: u32,
+        ) -> benchmark::ProviderBenchmarkResult {
+            self.calls
+                .borrow_mut()
+                .push((id.to_string(), model.to_string(), rounds));
+            let outcome = self
+                .results
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| benchmark::ProviderBenchmarkOutcome::Error("unexpected".to_string()));
+            benchmark::ProviderBenchmarkResult::new(id, outcome)
         }
     }
 
@@ -1200,6 +1457,368 @@ experimental_bearer_token = "sk-alpha"
         };
 
         let err = cmd_probe_select_with_runner(&mut config, &opts(true), &runner)
+            .expect_err("missing model should fail");
+
+        assert!(err.to_string().contains("missing model"));
+        assert!(runner.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn benchmark_select_reorders_by_recommended_score_and_sets_model_provider() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        write_config(
+            &config_path,
+            r#"
+model_provider = "slow"
+model = "gpt-5.4"
+
+[model_providers.slow]
+name = "OpenAI"
+base_url = "https://slow.example/v1"
+wire_api = "responses"
+requires_openai_auth = false
+experimental_bearer_token = "sk-slow"
+
+[model_providers.failfirst]
+name = "OpenAI"
+base_url = "https://failfirst.example/v1"
+wire_api = "responses"
+requires_openai_auth = false
+experimental_bearer_token = "sk-failfirst"
+
+[model_providers.fast]
+name = "OpenAI"
+base_url = "https://fast.example/v1"
+wire_api = "responses"
+requires_openai_auth = false
+experimental_bearer_token = "sk-fast"
+
+[model_providers.failsecond]
+name = "OpenAI"
+base_url = "https://failsecond.example/v1"
+wire_api = "responses"
+requires_openai_auth = false
+experimental_bearer_token = "sk-failsecond"
+"#,
+        );
+        let mut config = load_config(&config_path);
+        let runner = FakeBenchmarkRunner::with_results([
+            (
+                "slow",
+                benchmark::ProviderBenchmarkOutcome::Success(benchmark::ProviderBenchmarkStats {
+                    rounds: 2,
+                    median_ms: 320,
+                    avg_ms: 325,
+                    success_rate: 1.0,
+                    stability_ms: 10,
+                    samples_ms: vec![320, 330],
+                    first_token_median_ms: Some(120),
+                    first_token_avg_ms: Some(125),
+                    first_token_samples_ms: vec![120, 130],
+                    detail: None,
+                }),
+            ),
+            (
+                "failfirst",
+                benchmark::ProviderBenchmarkOutcome::Error("timeout".to_string()),
+            ),
+            (
+                "fast",
+                benchmark::ProviderBenchmarkOutcome::Success(benchmark::ProviderBenchmarkStats {
+                    rounds: 2,
+                    median_ms: 180,
+                    avg_ms: 185,
+                    success_rate: 1.0,
+                    stability_ms: 5,
+                    samples_ms: vec![180, 190],
+                    first_token_median_ms: Some(70),
+                    first_token_avg_ms: Some(75),
+                    first_token_samples_ms: vec![70, 80],
+                    detail: None,
+                }),
+            ),
+            (
+                "failsecond",
+                benchmark::ProviderBenchmarkOutcome::Error("http 503".to_string()),
+            ),
+        ]);
+
+        cmd_benchmark_select_with_runner(
+            &mut config,
+            &opts(true),
+            cli::BenchmarkSelectArgs { rounds: 2 },
+            &runner,
+        )
+        .expect("benchmark-select should succeed");
+
+        assert_eq!(
+            runner.calls.borrow().as_slice(),
+            &[
+                ("slow".to_string(), "gpt-5.4".to_string(), 2),
+                ("failfirst".to_string(), "gpt-5.4".to_string(), 2),
+                ("fast".to_string(), "gpt-5.4".to_string(), 2),
+                ("failsecond".to_string(), "gpt-5.4".to_string(), 2),
+            ]
+        );
+        assert_eq!(config.get_model_provider().as_deref(), Some("fast"));
+        assert_eq!(
+            config.provider_ids_in_order(),
+            vec![
+                "fast".to_string(),
+                "slow".to_string(),
+                "failfirst".to_string(),
+                "failsecond".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn benchmark_reports_sorted_results_without_mutating_config() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        write_config(
+            &config_path,
+            r#"
+model_provider = "slow"
+model = "gpt-5.4"
+
+[model_providers.slow]
+name = "OpenAI"
+base_url = "https://slow.example/v1"
+wire_api = "responses"
+requires_openai_auth = false
+experimental_bearer_token = "sk-slow"
+
+[model_providers.failfirst]
+name = "OpenAI"
+base_url = "https://failfirst.example/v1"
+wire_api = "responses"
+requires_openai_auth = false
+experimental_bearer_token = "sk-failfirst"
+
+[model_providers.fast]
+name = "OpenAI"
+base_url = "https://fast.example/v1"
+wire_api = "responses"
+requires_openai_auth = false
+experimental_bearer_token = "sk-fast"
+
+[model_providers.failsecond]
+name = "OpenAI"
+base_url = "https://failsecond.example/v1"
+wire_api = "responses"
+requires_openai_auth = false
+experimental_bearer_token = "sk-failsecond"
+"#,
+        );
+        let config = load_config(&config_path);
+        let before = config.render();
+        let runner = FakeBenchmarkRunner::with_results([
+            (
+                "slow",
+                benchmark::ProviderBenchmarkOutcome::Success(benchmark::ProviderBenchmarkStats {
+                    rounds: 2,
+                    median_ms: 320,
+                    avg_ms: 325,
+                    success_rate: 1.0,
+                    stability_ms: 10,
+                    samples_ms: vec![320, 330],
+                    first_token_median_ms: Some(120),
+                    first_token_avg_ms: Some(125),
+                    first_token_samples_ms: vec![120, 130],
+                    detail: None,
+                }),
+            ),
+            (
+                "failfirst",
+                benchmark::ProviderBenchmarkOutcome::Error("timeout".to_string()),
+            ),
+            (
+                "fast",
+                benchmark::ProviderBenchmarkOutcome::Success(benchmark::ProviderBenchmarkStats {
+                    rounds: 2,
+                    median_ms: 180,
+                    avg_ms: 185,
+                    success_rate: 1.0,
+                    stability_ms: 5,
+                    samples_ms: vec![180, 190],
+                    first_token_median_ms: Some(70),
+                    first_token_avg_ms: Some(75),
+                    first_token_samples_ms: vec![70, 80],
+                    detail: None,
+                }),
+            ),
+            (
+                "failsecond",
+                benchmark::ProviderBenchmarkOutcome::Error("http 503".to_string()),
+            ),
+        ]);
+
+        cmd_benchmark_with_runner(&config, cli::BenchmarkSelectArgs { rounds: 2 }, &runner)
+            .expect("benchmark should succeed");
+
+        assert_eq!(
+            runner.calls.borrow().as_slice(),
+            &[
+                ("slow".to_string(), "gpt-5.4".to_string(), 2),
+                ("failfirst".to_string(), "gpt-5.4".to_string(), 2),
+                ("fast".to_string(), "gpt-5.4".to_string(), 2),
+                ("failsecond".to_string(), "gpt-5.4".to_string(), 2),
+            ]
+        );
+        assert_eq!(config.render(), before);
+        assert_eq!(config.get_model_provider().as_deref(), Some("slow"));
+        assert_eq!(
+            config.provider_ids_in_order(),
+            vec![
+                "slow".to_string(),
+                "failfirst".to_string(),
+                "fast".to_string(),
+                "failsecond".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn benchmark_select_leaves_config_unchanged_on_total_failure() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        write_config(
+            &config_path,
+            r#"
+model_provider = "alpha"
+model = "gpt-5.4"
+
+[model_providers.alpha]
+name = "OpenAI"
+base_url = "https://alpha.example/v1"
+wire_api = "responses"
+requires_openai_auth = false
+experimental_bearer_token = "sk-alpha"
+
+[model_providers.beta]
+name = "OpenAI"
+base_url = "https://beta.example/v1"
+wire_api = "responses"
+requires_openai_auth = false
+experimental_bearer_token = "sk-beta"
+"#,
+        );
+        let mut config = load_config(&config_path);
+        let before = config.render();
+        let runner = FakeBenchmarkRunner::with_results([
+            (
+                "alpha",
+                benchmark::ProviderBenchmarkOutcome::Error("timeout".to_string()),
+            ),
+            (
+                "beta",
+                benchmark::ProviderBenchmarkOutcome::Error("http 401".to_string()),
+            ),
+        ]);
+
+        let err = cmd_benchmark_select_with_runner(
+            &mut config,
+            &opts(true),
+            cli::BenchmarkSelectArgs { rounds: 2 },
+            &runner,
+        )
+        .expect_err("all-failure benchmark-select should error");
+
+        assert!(err.to_string().contains("no benchmarkable provider"));
+        assert_eq!(
+            runner.calls.borrow().as_slice(),
+            &[
+                ("alpha".to_string(), "gpt-5.4".to_string(), 2),
+                ("beta".to_string(), "gpt-5.4".to_string(), 2),
+            ]
+        );
+        assert_eq!(config.render(), before);
+    }
+
+    #[test]
+    fn benchmark_leaves_config_unchanged_on_total_failure() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        write_config(
+            &config_path,
+            r#"
+model_provider = "alpha"
+model = "gpt-5.4"
+
+[model_providers.alpha]
+name = "OpenAI"
+base_url = "https://alpha.example/v1"
+wire_api = "responses"
+requires_openai_auth = false
+experimental_bearer_token = "sk-alpha"
+
+[model_providers.beta]
+name = "OpenAI"
+base_url = "https://beta.example/v1"
+wire_api = "responses"
+requires_openai_auth = false
+experimental_bearer_token = "sk-beta"
+"#,
+        );
+        let config = load_config(&config_path);
+        let before = config.render();
+        let runner = FakeBenchmarkRunner::with_results([
+            (
+                "alpha",
+                benchmark::ProviderBenchmarkOutcome::Error("timeout".to_string()),
+            ),
+            (
+                "beta",
+                benchmark::ProviderBenchmarkOutcome::Error("http 401".to_string()),
+            ),
+        ]);
+
+        let err = cmd_benchmark_with_runner(&config, cli::BenchmarkSelectArgs { rounds: 2 }, &runner)
+            .expect_err("all-failure benchmark should error");
+
+        assert!(err.to_string().contains("no benchmarkable provider"));
+        assert_eq!(
+            runner.calls.borrow().as_slice(),
+            &[
+                ("alpha".to_string(), "gpt-5.4".to_string(), 2),
+                ("beta".to_string(), "gpt-5.4".to_string(), 2),
+            ]
+        );
+        assert_eq!(config.render(), before);
+        assert_eq!(config.get_model_provider().as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn benchmark_fails_when_top_level_model_is_missing() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        write_config(
+            &config_path,
+            r#"
+model_provider = "alpha"
+
+[model_providers.alpha]
+name = "OpenAI"
+base_url = "https://alpha.example/v1"
+wire_api = "responses"
+requires_openai_auth = false
+experimental_bearer_token = "sk-alpha"
+"#,
+        );
+        let config = load_config(&config_path);
+        let runner = FakeBenchmarkRunner {
+            calls: RefCell::new(Vec::new()),
+            results: [(
+                "alpha".to_string(),
+                benchmark::ProviderBenchmarkOutcome::Error("unexpected".to_string()),
+            )]
+            .into_iter()
+            .collect(),
+        };
+
+        let err = cmd_benchmark_with_runner(&config, cli::BenchmarkSelectArgs { rounds: 2 }, &runner)
             .expect_err("missing model should fail");
 
         assert!(err.to_string().contains("missing model"));
